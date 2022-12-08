@@ -1,3 +1,5 @@
+use std::f32::consts::E;
+
 use bevy::{
     core_pipeline::{core_2d::Transparent2d, tonemapping::Tonemapping},
     ecs::system::{
@@ -39,6 +41,7 @@ use crate::{PointLight2D, LIGHT_SHADER_HANDLE, SHADOW_SHADER_HANDLE};
 pub struct Light2dUniform {
     light_position: Vec3,
     light_color: Vec4,
+    falloff_intensity: f32,
     outer_angle: f32,
     inner_radius_mult: f32,
     inner_angle_mult: f32,
@@ -49,8 +52,10 @@ pub struct Light2dUniform {
 pub struct Light2dPipeline {
     view_layout: BindGroupLayout,
     light_layout: BindGroupLayout,
+    falloff_lookup_layout: BindGroupLayout,
+    falloff_lookup_gpu_image: GpuImage,
     point_light_lookup_layout: BindGroupLayout,
-    point_light_lookup_image: GpuImage,
+    point_light_lookup_gpu_image: GpuImage,
 }
 
 impl FromWorld for Light2dPipeline {
@@ -89,6 +94,29 @@ impl FromWorld for Light2dPipeline {
             label: Some("light_light_layout"),
         });
 
+        let falloff_lookup_layout =
+            render_device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                entries: &[
+                    BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                            view_dimension: TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("light2d_falloff_lookup_texture_layout"),
+            });
+
         let point_light_lookup_layout =
             render_device.create_bind_group_layout(&BindGroupLayoutDescriptor {
                 entries: &[
@@ -109,102 +137,149 @@ impl FromWorld for Light2dPipeline {
                         count: None,
                     },
                 ],
-                label: Some("sprite_material_layout"),
+                label: Some("light2d_point_light_lookup_texture_layout"),
             });
 
-        let point_light_lookup_image = {
-            const WIDTH: usize = 256;
-            const HEIGHT: usize = 256;
+        let point_light_lookup_gpu_image = create_gpu_image_from_image(
+            create_point_light_lookup_image(),
+            &render_device,
+            &default_sampler,
+            &render_queue,
+        );
 
-            let mut data = Vec::with_capacity(WIDTH * HEIGHT * 4);
-            let center = Vec2::new(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0);
-
-            for y in 0..HEIGHT {
-                for x in 0..WIDTH {
-                    let pos = Vec2::new(x as f32, y as f32);
-                    let distance = Vec2::distance(pos, center);
-                    let red = if x == WIDTH - 1 || y == HEIGHT - 1 {
-                        0.0
-                    } else {
-                        (1.0 - (2.0 * distance / (WIDTH as f32))).clamp(0.0, 1.0)
-                    };
-
-                    let angle = (pos - center).normalize().y.acos().abs() / std::f32::consts::PI; // 0-1
-                    let green = (1.0 - angle).clamp(0.0, 1.0);
-
-                    let direction = (center - pos).normalize();
-                    let blue = direction.x;
-                    let alpha = direction.y;
-
-                    data.push((red * 255.0) as u8); // 1~0 distance
-                    data.push((green * 255.0) as u8); // 1~0 angle
-                    data.push((blue * 255.0) as u8); // direction.x
-                    data.push((alpha * 255.0) as u8); // direction.y
-                }
-            }
-
-            let image = Image::new_fill(
-                Extent3d {
-                    width: 256,
-                    height: 256,
-                    depth_or_array_layers: 1,
-                },
-                TextureDimension::D2,
-                &data[..],
-                TextureFormat::bevy_default(),
-            );
-            let texture = render_device.create_texture(&image.texture_descriptor);
-            let sampler = match image.sampler_descriptor {
-                ImageSampler::Default => (**default_sampler).clone(),
-                ImageSampler::Descriptor(descriptor) => render_device.create_sampler(&descriptor),
-            };
-
-            let format_size = image.texture_descriptor.format.pixel_size();
-            render_queue.write_texture(
-                ImageCopyTexture {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: Origin3d::ZERO,
-                    aspect: TextureAspect::All,
-                },
-                &image.data,
-                ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(
-                        std::num::NonZeroU32::new(
-                            image.texture_descriptor.size.width * format_size as u32,
-                        )
-                        .unwrap(),
-                    ),
-                    rows_per_image: Some(
-                        std::num::NonZeroU32::new(
-                            image.texture_descriptor.size.height * format_size as u32,
-                        )
-                        .unwrap(),
-                    ),
-                },
-                image.texture_descriptor.size,
-            );
-
-            let texture_view = texture.create_view(&TextureViewDescriptor::default());
-            GpuImage {
-                texture,
-                texture_view,
-                texture_format: image.texture_descriptor.format,
-                sampler,
-                size: Vec2::new(
-                    image.texture_descriptor.size.width as f32,
-                    image.texture_descriptor.size.height as f32,
-                ),
-            }
-        };
+        let falloff_lookup_gpu_image = create_gpu_image_from_image(
+            create_falloff_lookup_image(),
+            &render_device,
+            &default_sampler,
+            &render_queue,
+        );
 
         Self {
             view_layout,
             light_layout,
+            falloff_lookup_layout,
+            falloff_lookup_gpu_image,
             point_light_lookup_layout,
-            point_light_lookup_image,
+            point_light_lookup_gpu_image,
         }
+    }
+}
+
+fn create_falloff_lookup_image() -> Image {
+    const WIDTH: usize = 2048;
+    const HEIGHT: usize = 128;
+    let mut data = Vec::with_capacity(WIDTH * HEIGHT * 4);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let alpha: f32 = x as f32 / WIDTH as f32;
+            let intensity: f32 = y as f32 / HEIGHT as f32;
+            let falloff = alpha.powf(E.powf(1.5 - 3.0 * intensity));
+            for u in falloff.to_bits().to_le_bytes() {
+                data.push(u);
+            }
+        }
+    }
+    Image::new_fill(
+        Extent3d {
+            width: WIDTH as u32,
+            height: HEIGHT as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &data[..],
+        TextureFormat::R32Float,
+    )
+}
+
+fn create_point_light_lookup_image() -> Image {
+    const WIDTH: usize = 256;
+    const HEIGHT: usize = 256;
+    let mut data = Vec::with_capacity(WIDTH * HEIGHT * 4 * 4);
+    let center = Vec2::new(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let pos = Vec2::new(x as f32, y as f32);
+            let distance = Vec2::distance(pos, center);
+            let red = if x == WIDTH - 1 || y == HEIGHT - 1 {
+                0.0
+            } else {
+                (1.0 - (2.0 * distance / (WIDTH as f32))).clamp(0.0, 1.0)
+            };
+
+            let angle_cos = (pos - center).normalize().y;
+            let angle_cos = if angle_cos.is_nan() { 1.0 } else { angle_cos };
+            let angle = angle_cos.acos().abs() / std::f32::consts::PI;
+            let green = (1.0 - angle).clamp(0.0, 1.0);
+
+            let direction = (center - pos).normalize();
+            let blue = direction.x;
+            let alpha = direction.y;
+
+            for f in vec![red, green, blue, alpha] {
+                for u in f.to_bits().to_le_bytes() {
+                    data.push(u);
+                }
+            }
+        }
+    }
+    println!("{}", Vec2::new(0.0, 0.0).normalize().y);
+    Image::new_fill(
+        Extent3d {
+            width: WIDTH as u32,
+            height: HEIGHT as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &data[..],
+        TextureFormat::Rgba32Float,
+    )
+}
+
+fn create_gpu_image_from_image(
+    image: Image,
+    render_device: &RenderDevice,
+    default_sampler: &DefaultImageSampler,
+    render_queue: &RenderQueue,
+) -> GpuImage {
+    let texture = render_device.create_texture(&image.texture_descriptor);
+    let sampler = match image.sampler_descriptor {
+        ImageSampler::Default => (**default_sampler).clone(),
+        ImageSampler::Descriptor(descriptor) => render_device.create_sampler(&descriptor),
+    };
+    let format_size = image.texture_descriptor.format.pixel_size();
+    render_queue.write_texture(
+        ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        &image.data,
+        ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(
+                std::num::NonZeroU32::new(image.texture_descriptor.size.width * format_size as u32)
+                    .unwrap(),
+            ),
+            rows_per_image: Some(
+                std::num::NonZeroU32::new(
+                    image.texture_descriptor.size.height * format_size as u32,
+                )
+                .unwrap(),
+            ),
+        },
+        image.texture_descriptor.size,
+    );
+    let texture_view = texture.create_view(&TextureViewDescriptor::default());
+    GpuImage {
+        texture,
+        texture_view,
+        texture_format: image.texture_descriptor.format,
+        sampler,
+        size: Vec2::new(
+            image.texture_descriptor.size.width as f32,
+            image.texture_descriptor.size.height as f32,
+        ),
     }
 }
 
@@ -240,6 +315,7 @@ impl SpecializedRenderPipeline for Light2dPipeline {
             layout: Some(vec![
                 self.view_layout.clone(),
                 self.light_layout.clone(),
+                self.falloff_lookup_layout.clone(),
                 self.point_light_lookup_layout.clone(),
             ]),
             primitive: PrimitiveState {
@@ -265,7 +341,6 @@ impl SpecializedRenderPipeline for Light2dPipeline {
 #[derive(Component, Clone, Copy)]
 pub struct ExtractedPointLight2d {
     pub transform: GlobalTransform,
-    pub intensity: Vec2,
 }
 
 pub fn extract_lights(
@@ -284,6 +359,7 @@ pub fn extract_lights(
                 Light2dUniform {
                     light_color: light.color.as_linear_rgba_f32().into(),
                     light_position: transform.translation(),
+                    falloff_intensity: light.falloff_intensity,
                     outer_angle: light.outer_angle,
                     inner_radius_mult: 1.0 / (1.0 - light.inner_radius),
                     inner_angle_mult: 1.0 / (light.outer_angle - light.inner_angle),
@@ -291,7 +367,6 @@ pub fn extract_lights(
                 },
                 ExtractedPointLight2d {
                     transform: *transform,
-                    intensity: light.falloff_intensity,
                 },
             ),
         ));
@@ -304,6 +379,7 @@ pub fn extract_lights(
 #[derive(Resource)]
 pub struct Light2dBindGroup {
     pub value: BindGroup,
+    pub falloff_lookup_bind_group: BindGroup,
     pub light_lookup_bind_group: BindGroup,
 }
 
@@ -323,18 +399,36 @@ pub fn queue_light_bind_group(
                 label: Some("light_bind_group"),
                 layout: &light2d_pipeline.light_layout,
             }),
-            light_lookup_bind_group: render_device.create_bind_group(&BindGroupDescriptor {
+            falloff_lookup_bind_group: render_device.create_bind_group(&BindGroupDescriptor {
                 entries: &[
                     BindGroupEntry {
                         binding: 0,
                         resource: BindingResource::TextureView(
-                            &light2d_pipeline.point_light_lookup_image.texture_view,
+                            &light2d_pipeline.falloff_lookup_gpu_image.texture_view,
                         ),
                     },
                     BindGroupEntry {
                         binding: 1,
                         resource: BindingResource::Sampler(
-                            &light2d_pipeline.point_light_lookup_image.sampler,
+                            &light2d_pipeline.falloff_lookup_gpu_image.sampler,
+                        ),
+                    },
+                ],
+                label: Some("light_lookup_bind_group"),
+                layout: &light2d_pipeline.point_light_lookup_layout,
+            }),
+            light_lookup_bind_group: render_device.create_bind_group(&BindGroupDescriptor {
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(
+                            &light2d_pipeline.point_light_lookup_gpu_image.texture_view,
+                        ),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::Sampler(
+                            &light2d_pipeline.point_light_lookup_gpu_image.sampler,
                         ),
                     },
                 ],
@@ -432,7 +526,7 @@ pub fn queue_lights(
                             .transform_point(quad_pos.extend(0.))
                             .into()
                     });
-                    let uvs = QUAD_UVS.map(|quad_uv| (quad_uv / extracted_light.intensity).into());
+                    let uvs = QUAD_UVS.map(|quad_uv| quad_uv.into());
 
                     // These items will be sorted by depth with other phase items
                     let sort_key = FloatOrd(extracted_light.transform.translation().z);
@@ -468,7 +562,8 @@ pub type DrawLight = (
     SetItemPipeline,
     SetLightViewBindGroup<0>,
     SetSpriteTextureBindGroup<1>,
-    SetLightLookupBindGroup<2>,
+    SetFalloffLookupBindGroup<2>,
+    SetLightLookupBindGroup<3>,
     DrawLightBatch,
 );
 pub struct SetLightViewBindGroup<const I: usize>;
@@ -525,6 +620,21 @@ impl<const I: usize> EntityRenderCommand for SetLightLookupBindGroup<I> {
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         pass.set_bind_group(I, &bind_groups.into_inner().light_lookup_bind_group, &[]);
+        RenderCommandResult::Success
+    }
+}
+
+pub struct SetFalloffLookupBindGroup<const I: usize>;
+impl<const I: usize> EntityRenderCommand for SetFalloffLookupBindGroup<I> {
+    type Param = SRes<Light2dBindGroup>;
+
+    fn render<'w>(
+        _view: Entity,
+        item: Entity,
+        bind_groups: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        pass.set_bind_group(I, &bind_groups.into_inner().falloff_lookup_bind_group, &[]);
         RenderCommandResult::Success
     }
 }
