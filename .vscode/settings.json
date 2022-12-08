@@ -1,0 +1,8 @@
+{
+    "workbench.colorCustomizations": {
+        "[One Monokai]": {
+            "editorInlayHint.foreground": "#868686f0",
+            "editorInlayHint.background": "#00000000",
+        }
+    },
+}
