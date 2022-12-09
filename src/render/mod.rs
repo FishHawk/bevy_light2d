@@ -1,14 +1,18 @@
-use std::f32::consts::E;
+use std::{f32::consts::E, sync::atomic::AtomicUsize};
 
 use bevy::{
-    core_pipeline::{core_2d::Transparent2d, tonemapping::Tonemapping},
+    core_pipeline::{
+        clear_color::ClearColorConfig, core_2d::Transparent2d, tonemapping::Tonemapping,
+    },
     ecs::system::{
         lifetimeless::{Read, SQuery, SRes},
         SystemParamItem, SystemState,
     },
     prelude::*,
     render::{
+        camera::{CameraRenderGraph, ExtractedCamera},
         extract_component::{ComponentUniforms, DynamicUniformIndex},
+        render_asset::RenderAssets,
         render_phase::{
             BatchedPhaseItem, DrawFunctions, EntityRenderCommand, RenderCommand,
             RenderCommandResult, RenderPhase, SetItemPipeline, TrackedRenderPass,
@@ -21,21 +25,26 @@ use bevy::{
             MultisampleState, Origin3d, PipelineCache, PolygonMode, PrimitiveState,
             PrimitiveTopology, RenderPipelineDescriptor, SamplerBindingType, ShaderStages,
             ShaderType, SpecializedRenderPipeline, SpecializedRenderPipelines, TextureAspect,
-            TextureDimension, TextureFormat, TextureSampleType, TextureViewDescriptor,
-            TextureViewDimension, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
+            TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+            TextureViewDescriptor, TextureViewDimension, VertexBufferLayout, VertexFormat,
+            VertexState, VertexStepMode,
         },
         renderer::{RenderDevice, RenderQueue},
         texture::{
-            BevyDefault, DefaultImageSampler, GpuImage, ImageSampler, TextureFormatPixelInfo,
+            BevyDefault, DefaultImageSampler, GpuImage, ImageSampler, TextureCache,
+            TextureFormatPixelInfo,
         },
-        view::{ExtractedView, ViewUniform, ViewUniformOffset, ViewUniforms, VisibleEntities},
+        view::{
+            ExtractedView, ExtractedWindows, ViewTarget, ViewUniform, ViewUniformOffset,
+            ViewUniforms, VisibleEntities,
+        },
         Extract,
     },
-    utils::FloatOrd,
+    utils::{FloatOrd, HashMap},
 };
 use bytemuck::{Pod, Zeroable};
 
-use crate::{PointLight2D, LIGHT_SHADER_HANDLE, SHADOW_SHADER_HANDLE};
+use crate::{PointLight2d, LIGHT_SHADER_HANDLE, SHADOW_SHADER_HANDLE};
 
 #[derive(Component, ShaderType, Clone)]
 pub struct Light2dUniform {
@@ -222,7 +231,6 @@ fn create_point_light_lookup_image() -> Image {
             }
         }
     }
-    println!("{}", Vec2::new(0.0, 0.0).normalize().y);
     Image::new_fill(
         Extent3d {
             width: WIDTH as u32,
@@ -346,7 +354,7 @@ pub struct ExtractedPointLight2d {
 pub fn extract_lights(
     mut commands: Commands,
     mut previous_len: Local<usize>,
-    light_query: Extract<Query<(Entity, &ComputedVisibility, &PointLight2D, &GlobalTransform)>>,
+    light_query: Extract<Query<(Entity, &ComputedVisibility, &PointLight2d, &GlobalTransform)>>,
 ) {
     let mut values = Vec::with_capacity(*previous_len);
     for (entity, visibility, light, transform) in light_query.iter() {
