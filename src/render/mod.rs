@@ -1,5 +1,6 @@
 pub mod light;
 pub mod overlay;
+pub mod shadow;
 
 use std::ops::Deref;
 
