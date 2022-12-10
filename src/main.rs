@@ -2,12 +2,13 @@ use bevy::{
     core_pipeline::clear_color::ClearColorConfig,
     prelude::*,
     render::{
-        camera::RenderTarget,
         render_resource::{
             Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
         },
+        view::RenderLayers,
     },
 };
+use city::render::Light2dOverlay;
 use city::{Light2dPlugin, PointLight2d, Shadow2d};
 
 fn main() {
@@ -49,24 +50,14 @@ fn setup(
 
     let image_handle = images.add(image);
 
-    commands.spawn((
-        Camera2dBundle {
-            camera_2d: Camera2d {
-                clear_color: ClearColorConfig::Custom(Color::BLACK),
-                ..default()
-            },
-            camera: Camera {
-                // render before the "main pass" camera
-                priority: -1,
-                target: RenderTarget::Image(image_handle.clone()),
-                ..default()
-            },
-            ..default()
-        },
-        // first_pass_layer,
-    ));
-
-    commands.spawn(Camera2dBundle::default());
+    let parent = commands.spawn(Camera2dBundle::default()).id();
+    let child = commands
+        .spawn(Light2dOverlay {
+            image: image_handle.clone(),
+            size: UVec2::new(size.width, size.height),
+        })
+        .id();
+    commands.entity(parent).push_children(&[child]);
 
     // Sprites
     commands.spawn(SpriteBundle {
@@ -85,7 +76,7 @@ fn setup(
             SpatialBundle {
                 transform: Transform {
                     translation: Vec3::new(x, y, 1.0),
-                    scale: Vec3::new(1000.0, 1000.0, 0.0),
+                    scale: Vec3::new(500.0, 500.0, 0.0),
                     ..default()
                 },
                 ..default()
